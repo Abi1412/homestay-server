@@ -10,37 +10,33 @@ dotenv.config();
 
 const app = express();
 
-// Security middleware
+// Security middlewares
 app.use(helmet());
 app.use(express.json());
 
-// CORS — allow only your frontend (and localhost for testing)
-const allowedOrigins = [
-  "https://homestay-website-chi.vercel.app", // your Vercel site
-  "http://localhost:5501",
-  "http://127.0.0.1:5501"
-];
+// Allowed frontend URL (Vercel)
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN;
 
+// Strict CORS policy: only allow Vercel frontend
 app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // allow Postman
-    if (allowedOrigins.includes(origin)) return cb(null, true);
-    return cb(new Error("Not allowed by CORS"));
-  }
+  origin: FRONTEND_ORIGIN,
+  methods: ["GET", "POST"],
+  allowedHeaders: ["Content-Type", "x-admin-key"],
 }));
 
 // Rate limiting
 app.use(rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100
+  max: 100,
 }));
 
-// Database connection
+// PostgreSQL connection
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
 });
 
-// Joi schema validation
+// Joi validation schema for bookings
 const bookingSchema = Joi.object({
   homestay_id: Joi.string().required(),
   date: Joi.date().iso().required(),
@@ -53,10 +49,15 @@ const bookingSchema = Joi.object({
   special_requests: Joi.string().max(1000).allow("", null)
 });
 
-// POST booking
+// ================================
+// 📌 CREATE BOOKING
+// ================================
 app.post("/api/bookings", async (req, res) => {
   const { error, value } = bookingSchema.validate(req.body);
-  if (error) return res.status(400).json({ error: error.message });
+
+  if (error) {
+    return res.status(400).json({ error: error.message });
+  }
 
   const {
     homestay_id,
@@ -76,36 +77,34 @@ app.post("/api/bookings", async (req, res) => {
     await client.query("BEGIN");
 
     // Check if date already booked
-    const check = await client.query(
+    const existing = await client.query(
       "SELECT id FROM bookings WHERE homestay_id = $1 AND date = $2 FOR UPDATE",
       [homestay_id, date]
     );
 
-    if (check.rowCount > 0) {
+    if (existing.rowCount > 0) {
       await client.query("ROLLBACK");
-      return res.status(409).json({
-        error: "Selected date already booked for this homestay"
-      });
+      return res.status(409).json({ error: "Selected date already booked for this homestay" });
     }
 
-    const insertSql = `
-      INSERT INTO bookings
+    // Insert new booking
+    const result = await client.query(
+      `INSERT INTO bookings
       (homestay_id, date, time_slot, guest_name, phone, email, address, guests, special_requests)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-      RETURNING id, created_at
-    `;
-
-    const result = await client.query(insertSql, [
-      homestay_id,
-      date,
-      time_slot,
-      guest_name,
-      phone,
-      email || null,
-      address || null,
-      guests,
-      special_requests || null
-    ]);
+      RETURNING id, created_at`,
+      [
+        homestay_id,
+        date,
+        time_slot,
+        guest_name,
+        phone,
+        email || null,
+        address || null,
+        guests,
+        special_requests || null
+      ]
+    );
 
     await client.query("COMMIT");
 
@@ -115,47 +114,47 @@ app.post("/api/bookings", async (req, res) => {
       createdAt: result.rows[0].created_at
     });
 
-  } catch (e) {
+  } catch (err) {
     await client.query("ROLLBACK");
-    if (e.code === "23505") {
-      return res.status(409).json({ error: "Selected date already booked" });
-    }
-    console.error(e);
-    return res.status(500).json({ error: "Internal server error" });
+    console.error("Booking error:", err);
+    res.status(500).json({ error: "Internal server error" });
 
   } finally {
     client.release();
   }
 });
 
-// Admin key (for GET all bookings)
+// ================================
+// 📌 ADMIN — VIEW ALL BOOKINGS
+// ================================
 const ADMIN_KEY = process.env.ADMIN_API_KEY;
 
-// GET all bookings
 app.get("/api/bookings", async (req, res) => {
   if (req.header("x-admin-key") !== ADMIN_KEY) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
   try {
-    const result = await pool.query(`
-      SELECT *
-      FROM bookings
-      ORDER BY created_at DESC
-    `);
-    res.json(result.rows);
+    const data = await pool.query("SELECT * FROM bookings ORDER BY created_at DESC");
+    return res.json(data.rows);
 
-  } catch (e) {
-    console.error(e);
+  } catch (err) {
+    console.error("Admin fetch error:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// Health check for Render
-app.get("/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
+// ================================
+// 📌 Health Check (for Render keep-alive)
+// ================================
+app.get("/health", (req, res) => {
+  res.json({ ok: true, ts: Date.now() });
+});
 
-// PORT — Render provides PORT automatically
-const port = process.env.PORT || 4001;
+// ================================
+// 📌 Start Server on Render
+// ================================
+const port = process.env.PORT || 4000;
 app.listen(port, () => {
   console.log(`API running on port ${port}`);
 });
